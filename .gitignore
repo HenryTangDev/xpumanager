@@ -32,3 +32,4 @@ third_party/hwloc/install/*
 *.log
 .ccache/
 amcmcli/src/config.h
+worktrees/
