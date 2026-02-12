@@ -172,6 +172,135 @@ This document proposes restructuring the Intel XPU Manager core library (`libxpu
 └─────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
+## Architectural Layers
+
+The XPU Manager system is organized into **5 distinct layers**, from user-facing interfaces down to hardware:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────┐
+│                          Layer 1: User Interfaces                          │
+│                                                                                     │
+│  ┌──────────┐   ┌───────────┐   ┌──────────┐   ┌──────────┐       │
+│  │ xpumcli   │   │ REST API   │   │Prometheus │   │ xpu-smi   │       │
+│  │  (CLI)     │   │(Flask+     │   │Exporter    │   │(standalone)│       │
+│  │             │   │Gunicorn)   │   │            │   │             │       │
+│  └─────┬─────┘   └─────┬─────┘   └─────┬─────┘   └─────┬─────┘       │
+│        │ gRPC              │ gRPC               │ gRPC                  │              │          │       │
+└────────┼────────────────────┼────────────────────┼───────────────────────┼──────────────────┘
+         │                    │                     │                       │                  │
+         ▼                    ▼                     ▼                       │                  │
+┌─────────────────────────────────────────────────────────────────────────────────────────┐
+│                          Layer 2: Daemon Layer                           │
+│                                                                                     │
+│  ┌──────────────────────────────────────────────────────────────────────────────────┐  │
+│  │                    xpumd (Daemon)                                │  │
+│  │                                                                   │  │
+│  │  - gRPC Service Implementations (*_service_impl.cpp)          │  │
+│  │  - Manages privileged hardware access                                │  │
+│  └───────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────────────────────────────────┐
+│                          Layer 3: Core Library (libxpum_core.so)            │
+│                                                                                     │
+│  ┌────────────────────────────────────────────────────────────────────────────────┐  │
+│  │                  Public C API Layer (xpum_api.h)                │  │
+│  │                                                                  │  │
+│  │  xpumInit / xpumGetStats / xpumRunDiag / ...           │  │
+│  └────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                     │
+│  ┌────────────────────────────────────────────────────────────────────────────────┐  │
+│  │                        Core Services (always resident)               │  │
+│  │  ┌────────────┐ ┌────────────┐ ┌────────────┐ ┌────────────┐       │
+│  │  │DeviceMgr   │ │ FieldCache  │ │Configuration │ │ScheduledThrd │       │
+│  │  │             │ │             │ │             │ │    Pool     │       │
+│  │  │Device list  │ │ Time-series │ │Global cfg   │ │Background   │       │
+│  │  │ze handles   │ │storage     │ │             │ │tasks       │       │
+│  │  └────────────┘ └────────────┘ └────────────┘ └────────────┘       │
+│  │                                                                │
+│  └────────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                     │
+│  ┌────────────────────────────────────────────────────────────────────────────────┐  │
+│  │                        Module Manager                            │  │
+│  │  - Tier 1 Registry (IDs 0-31)                              │  │
+│  │  - Tier 2 Discovery (plugins/)                               │  │
+│  │  - Selective Loader (lazy loading)                            │  │
+│  │  - Message Router                                            │  │
+│  └────────────────────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+         │                           │                                   │
+         ▼                           ▼                                   ▼
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                          Layer 4: Module Layer (10 + unlimited)               │
+│                                                                              │
+│  ┌──────────────────────────────────────────────────────────────────────────────────┐  │
+│  │                    Tier 1: Built-in Modules (shipped with package)        │  │
+│  │                                                                      │  │
+│  │  Monitor(1) │ Health(2) │ Diag(3) │ Firmware(4) │ Policy(5)    │  │       │
+│  │     ↓         │     ↓        │    ↓       │     ↓         │     │         │     │       │
+│  │ Collects    │ Threshold  │ L1/L2/L3  │ GFX/AMC    │ Automated  │    │       │
+│  │ metrics     │ checks     │ tests      │ updates    │ policy     │         │       │
+│  │ → Field    │ → Field    │ → Field    │             │ → Field    │         │       │
+│  │   Cache     │   Cache    │   Cache    │             │   Cache     │         │       │
+│  │                                                                      │  │
+│  │ Config(6) │ Topology(7) │ vGPU(8) │ Group(9) │ Dump(10)  │       │
+│  │ Power/Freq  │ hwloc      │ SR-IOV     │ Device     │ Raw data   │         │       │
+│  │ ECC        │ topology   │ vGPU mgmt  │ grouping   │ export     │         │       │
+│  └───────────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+│  ┌──────────────────────────────────────────────────────────────────────────────────┐  │
+│  │                    Tier 2: Extension Plugins (drop-in .so files)         │  │
+│  │                                                                      │  │
+│  │  xe2_perf.so │ custom_health.so │ oam_monitor.so │ ... (unlimited) │  │
+│  │                                                                      │  │
+│  │  - IDs 32+ assigned dynamically                                    │  │
+│  │  - Self-describing via xpum_get_module_descriptor()               │  │
+│  │  - Capability-based routing (DIAGNOSTIC, HEALTH, etc.)        │  │
+│  └──────────────────────────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────────────────────────────────┐
+│                          Layer 5: Hardware / Driver Layer                    │
+│                                                                              │
+│  ┌──────────────────────────────────────────────────────────────────────────────────┐  │
+│  │                    Intel Level Zero Driver API                        │  │
+│  │                                                                  │  │
+│  │  - zeDevice / zesDevice handles                              │  │
+│  │  - Device properties / metrics                                  │  │
+│  │  - Firmware update interfaces                                   │  │
+│  │  - Configuration controls (power, frequency, ECC)                   │  │
+│  └───────────────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+│  ┌──────────────────────────────────────────────────────────────────────────────────┐  │
+│  │                    Intel GPU Hardware (Flex / Max / Arc B Series)         │  │
+│  │                                                                  │  │
+│  │  - Compute units / Tiles / Memory                                │  │
+│  │  - Power management                                              │  │
+│  │  - Video encode/decode                                           │  │
+│  └───────────────────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Layer Summary
+
+| # | Layer | Description | Components | Count |
+|---|--------|-------------|------------|-------|
+| 1 | **User Interfaces** | CLI, REST API, Prometheus Exporter, Standalone xpu-smi | 4 interfaces |
+| 2 | **Daemon Layer** | xpumd with gRPC services | 1 daemon |
+| 3 | **Core Library** | Public C API, Core Services, Module Manager | 3 subsystems |
+| 4 | **Module Layer** | Tier 1 built-in (10 modules) + Tier 2 plugins (unlimited) | 10+ modules |
+| 5 | **Hardware/Driver** | Intel Level Zero Driver + GPU Hardware | 1 driver + N GPUs |
+
+**Key Design Principle:**
+- **Layer isolation**: Each layer communicates only with adjacent layers
+- **Dependency flow**: Upper layers depend on lower layers, but lower layers have no dependency on upper layers
+- **Extensibility**: Layer 4 (Module Layer) supports Tier 2 plugins without modifying core
+
+---
+
 ### DCGM Comparison
 
 ```
@@ -1916,6 +2045,87 @@ xpumcli vgpu create -d 0 -n 4 -c 0,1
 │                                                                               │
 └───────────────────────────────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## Module Reference
+
+### Tier 1: Built-in Modules
+
+| # | Module | ID | Library | Purpose | Dependencies |
+|---|---------|-----|----------|---------------|
+| 1 | Monitor | 1 | libxpum_mod_monitor.so | Collects telemetry metrics into FieldCache | None |
+| 2 | Health | 2 | libxpum_mod_health.so | Threshold-based health monitoring | Monitor |
+| 3 | Diagnostic | 3 | libxpum_mod_diag.so | L1/L2/L3 diagnostic tests | Monitor |
+| 4 | Firmware | 4 | libxpum_mod_firmware.so | GFX and AMC firmware updates | None |
+| 5 | Policy | 5 | libxpum_mod_policy.so | Automated policy engine | Monitor, Group |
+| 6 | Config | 6 | libxpum_mod_config.so | Power, frequency, ECC configuration | None |
+| 7 | Topology | 7 | libxpum_mod_topology.so | Hardware topology via hwloc | None |
+| 8 | vGPU | 8 | libxpum_mod_vgpu.so | SR-IOV virtual GPU management | None |
+| 9 | Group | 9 | libxpum_mod_group.so | Device grouping and batch operations | None |
+| 10 | Dump | 10 | libxpum_mod_dump.so | Raw data export | Monitor |
+
+### Tier 2: Extension Plugins
+
+Tier 2 plugins are dynamically discovered from `/usr/lib/xpum/plugins/` at runtime. No core changes required.
+
+| Example Plugin | ID | Library | Capability | Device Filter |
+|--------------|-----|----------|----------------|
+| Xe2 Performance | 32+ | libxpum_plugin_xe2_perf.so | DIAGNOSTIC | Xe2 GPUs only |
+| Custom Health | 32+ | libxpum_plugin_custom_health.so | HEALTH | All devices |
+| OAM Monitor | 32+ | libxpum_plugin_oam_monitor.so | MONITORING | OAM boards |
+
+**Key Characteristics:**
+- IDs 32+ assigned dynamically at registration time
+- Self-describing via `xpum_get_module_descriptor()`
+- Capability-based routing (DIAGNOSTIC, HEALTH, MONITORING, etc.)
+- Optional PCI ID device filtering
+
+### Module Dependency Graph
+
+```
+                    ┌─────────────┐
+                    │   MONITOR   │ (ID=1)
+                    │  (no deps)  │
+                    └──────┬──────┘
+                           │
+         ┌─────────────────┼─────────────────┐
+         │                 │                 │
+         ▼                 ▼                 ▼
+   ┌───────────┐   ┌───────────┐   ┌───────────┐
+   │  HEALTH    │   │   DIAG      │   │   DUMP      │
+   │   (ID=2)   │   │   (ID=3)   │   │  (ID=10)   │
+   └───────────┘   └───────────┘   └───────────┘
+
+   ┌───────────┐   ┌───────────┐   ┌───────────┐
+   │  POLICY    │   │  CONFIG     │   │  TOPOLOGY   │
+   │   (ID=5)   │   │   (ID=6)   │   │   (ID=7)   │
+   │   deps:      │   │  (no deps)  │   │  (no deps)  │
+   │ [MONITOR,   │   └────────────┘   └────────────┘
+   │  GROUP]     │
+   └──────┬──────┘
+          │
+          ▼
+   ┌───────────┐
+   │  GROUP     │
+   │   (ID=9)   │
+   │  (no deps)  │
+   └──────┬──────┘
+          │
+          │ (used by Policy)
+          ▼
+
+   ┌───────────┐   ┌───────────┐   ┌───────────┐
+   │  FIRMWARE  │   │   VGPU      │   │  (Tier 2)   │
+   │   (ID=4)   │   │   (ID=8)   │   │  Plugins     │
+   │  (no deps)  │   │  (no deps)  │   │  (IDs 32+)  │
+   └────────────┘   └────────────┘   └────────────┘
+```
+
+**Dependency Notes:**
+- **MONITOR**: Core dependency for HEALTH, DIAG, DUMP, POLICY
+- **GROUP**: Required by POLICY for device group operations
+- **All other modules**: No inter-module dependencies
 
 ---
 
